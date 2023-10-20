@@ -1,0 +1,634 @@
+`---
+title: "RNA-seq analysis of all our RNA-seq datasets"
+author: "Martin Převorovský, prevorov@natur.cuni.cz, http://www.GenoMik.cz"
+output: html_document
+---
+
+This analysis utilizes data the following two experiments:
+
+* 2020_RNA-seq_ammonium (WT, cbf11 in YES / YES+ammonium)
+
+* 2022_RNA-seq_mga2 (mga2, mga2 cbf11 in YES / YES+ammonium)
+
+* 2022_RNA-seq_CSL-DBM+cerulenin (Cbf11-DBM in YES / YES+ammonium; cerulenin treatment; Pcut6MUT)
+
+```{r setup, message=FALSE}
+library(rtracklayer)
+library(GenomicAlignments)
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(RUVSeq)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+genome_dir <- './genome/'
+genome_gff <- paste0(genome_dir, 'Schizosaccharomyces_pombe_all_chromosomes.gff3')
+coverage_dir <- './coverage_RNA-seq/'
+image_dir <- './images/'
+deg_dir <- './DEG_RNA-seq_ALL/'
+```
+
+# Identify differentially expressed genes
+
+## Generate gene-level counts tables.
+
+* Raw count data are needed for DEG calling in `DESeq2`.
+
+* TPM-normalized (Transcripts Per Million) count data are suitable for general comparisons of the samples.
+
+```{r, eval=TRUE}
+gff <- import.gff3(genome_gff)
+gff.genes <- gff[gff$type == 'gene', ]
+
+sample_info <- read.delim('sampleInfo_ALL', stringsAsFactors = FALSE, header = TRUE, sep = '\t')
+sample_info[, 'cultivation_run'] <- factor(sample_info[, 'cultivation_run'])
+sample_info[, 'genotype'] <- factor(sample_info[, 'genotype'])
+sample_info[, 'medium'] <- factor(sample_info[, 'medium'])
+sample_info[, 'sequencing_run'] <- factor(sample_info[, 'sequencing_run'])
+
+# SE runs
+bam1 <- BamFileList(sample_info[sample_info$sequencing_run %in% c(2, 3), 'bam_file'],
+                    asMates = FALSE,
+                    yieldSize = 1000000)
+names(bam1) <- sample_info[sample_info$sequencing_run %in% c(2, 3), 'sample_ID']
+se1 <- summarizeOverlaps(gff.genes,
+                         bam1,
+                         mode = 'Union',
+                         singleEnd = TRUE,
+                         ignore.strand = FALSE,
+                         preprocess.reads = invertStrand)
+
+# PE runs
+bam2 <- BamFileList(sample_info[sample_info$sequencing_run == 1, 'bam_file'],
+                    asMates = TRUE,
+                    yieldSize = 1000000)
+names(bam2) <- sample_info[sample_info$sequencing_run == 1, 'sample_ID']
+se2 <- summarizeOverlaps(gff.genes,
+                         bam2,
+                         mode = 'Union',
+                         singleEnd = FALSE,
+                         fragments = FALSE,
+                         ignore.strand = FALSE,
+                         preprocess.reads = invertStrand)
+
+se <- cbind(se2, se1)
+rownames(se) <- gff.genes$ID
+colData(se) <- cbind(colData(se), sample_info)
+save(se, se1, se2, file = 'se_ALL.rda')
+#load(file = 'se_ALL.rda')
+
+counts <- assay(se)
+
+# normalize to get TPM values (transcripts per million)
+gene_widths <- width(gff.genes)
+counts.norm <- counts
+for (i in 1:nrow(counts.norm)){
+  counts.norm[i, ] <- counts.norm[i, ] / gene_widths[i]
+}
+count_sums <- colSums(counts.norm) / 1000000
+for (i in 1:length(count_sums)){
+  counts.norm[, i] <- counts.norm[, i] / count_sums[i]
+}
+
+counts <- cbind(gff.genes$Name, counts)
+counts.norm <- cbind(gff.genes$Name, counts.norm)
+colnames(counts)[1] <- 'gene_name'
+colnames(counts.norm)[1] <- 'gene_name'
+write.csv(counts, file = paste0(coverage_dir, 'counts_ALL.csv'), quote = FALSE)
+write.csv(counts.norm, file = paste0(coverage_dir, 'counts_ALL.TPM-normalized.csv'), quote = FALSE)
+rm(gene_widths, count_sums)
+```
+
+## QC of count table data
+
+```{r, eval=TRUE}
+dds <- DESeqDataSet(se, design = ~ cultivation_run + medium + genotype)
+dds <- DESeq(dds)
+rld <- rlog(dds, blind = TRUE)
+
+sampleDists <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- rld$sample_ID
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pdf(paste0(image_dir, 'heatmap_RNA-seq_sampleDist_rlog_ALL.pdf'))
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+dev.off()
+
+pdf(paste0(image_dir, 'PCA_RNA-seq_rlog_ALL.pdf'))
+plotPCA(rld, intgroup = c('genotype', 'medium', 'cultivation_run'))
+plotPCA(rld, intgroup = 'genotype')
+plotPCA(rld, intgroup = 'medium')
+plotPCA(rld, intgroup = 'cultivation_run')
+plotPCA(rld, intgroup = 'sequencing_run')
+dev.off()
+```
+
+* Heatmap and PCA results - samples cluster strongly within triplicates.
+
+
+## Normalization between samples
+
+It is strange that cbf11KO clusters away from cbf11DBM and mga2. It might be due to batch effects (both groups were sequenced at different times on different machines...). Will try to normalize this using EDASeq between-lane normalization methods.
+
+```{r, eval=FALSE}
+library(EDASeq)
+
+norm_counts <- betweenLaneNormalization(assay(se),
+                                        which = "upper", 
+                                        offset = FALSE, 
+                                        round = TRUE)
+# cbf11
+dds.norm <- DESeqDataSetFromMatrix(countData = norm_counts,
+                              colData = sample_info,
+                              design = ~ cultivation_run + genotype)
+dds.norm <- dds.norm[, dds.norm$medium == 'YES']
+dds.norm <- dds.norm[, dds.norm$genotype %in% c('cbf11', 'WT')]
+dds.norm$medium <- droplevels(dds.norm$medium)
+dds.norm$genotype <- droplevels(dds.norm$genotype)
+dds.norm$genotype <- relevel(dds.norm$genotype, ref = 'WT')
+dds.norm <- DESeq(dds.norm)
+res <- results(dds.norm, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.EDASeq-norm.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.EDASeq-norm.SIG.csv'), quote = FALSE)
+
+# cbf11DBM
+dds.norm <- DESeqDataSetFromMatrix(countData = norm_counts,
+                              colData = sample_info,
+                              design = ~ cultivation_run + genotype)
+dds.norm <- dds.norm[, dds.norm$medium == 'YES']
+dds.norm <- dds.norm[, dds.norm$genotype %in% c('cbf11DBM', 'WT')]
+dds.norm$medium <- droplevels(dds.norm$medium)
+dds.norm$genotype <- droplevels(dds.norm$genotype)
+dds.norm$genotype <- relevel(dds.norm$genotype, ref = 'WT')
+dds.norm <- DESeq(dds.norm)
+res <- results(dds.norm, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.EDASeq-norm.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.EDASeq-norm.SIG.csv'), quote = FALSE)
+```
+
+* Numbers of DEGs decreased by ~20%, but final DEG overlaps between cbf11 and cbf11DBM (RNA-seq, microarrays, only >=2 fold change) were very similar. So the normalization did not help and will not be used.
+
+
+Next tried the RUVs method (normalization using replicates) from the RUVSeq package
+
+```{r, eval=FALSE}
+library(RUVSeq)
+padj_threshold <- 0.05
+load('se_ALL.rda')
+
+dds <- DESeqDataSet(se, design = ~ genotype)
+dds <- dds[, dds$medium == 'YES']
+dds <- dds[, dds$genotype %in% c('cbf11', 'cbf11DBM', 'WT', 'mga2', 'mga2_cbf11')]
+dds$medium <- droplevels(dds$medium)
+dds$genotype <- droplevels(dds$genotype)
+
+differences <- makeGroups(dds$genotype)
+pheno_data <- data.frame(dds$genotype, row.names=paste0(dds$sample_ID, '_', dds$sequencing_run))
+counts_ruv <- counts(dds)
+rownames(counts_ruv) <- rownames(counts(dds))
+colnames(counts_ruv) <- paste0(dds$sample_ID, '_', dds$sequencing_run)
+set <- newSeqExpressionSet(counts_ruv,
+                           phenoData = as(pheno_data, "AnnotatedDataFrame"))
+set <- betweenLaneNormalization(set, which="upper")
+set3 <- RUVs(set, gff.genes$ID, k=1, differences)
+dds.norm <- DESeqDataSetFromMatrix(countData = counts_ruv,
+                                   colData = pData(set3),
+                                   design = ~ W_1 + dds.genotype)
+
+rld <- vst(dds, blind = TRUE)
+rld.norm <- vst(dds.norm, blind = TRUE)
+plotPCA(rld, intgroup = 'genotype')
+plotPCA(rld.norm, intgroup = 'dds.genotype')
+
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold, contrast = c("genotype", "cbf11DBM", "WT"))
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+
+dds.norm <- DESeq(dds.norm)
+
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("dds.genotype", "cbf11", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+colnames(res.norm)[1] <- 'gene_name'
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("dds.genotype", "cbf11DBM", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+colnames(res.norm)[1] <- 'gene_name'
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+```
+
+* Number os DEGs increased for cbf11 and decreased for cbf11DBM (mostly among ncRNAs). Overlaps of RNA-seq and microarray coding (!) DEGs now look more reasonable (balanced between 11 and 11DBM). Normalization will be used for production.
+
+
+## DEG calling
+
+```{r, eval=TRUE}
+# Benjamini-Hochberg p value adjustment (FDR)
+padj_threshold <- 0.05
+
+dir.create(deg_dir)
+
+# Pcut6MUT-YES vs WT-YES
+dds <- DESeqDataSet(se, design = ~ genotype)
+dds <- dds[, dds$medium == 'YES'] # remove YES+ammonium/DMSO/cerulenin samples
+dds <- dds[, dds$genotype %in% c('Pcut6MUT', 'WT')] # remove YES+ammonium/DMSO/cerulenin samples
+dds$medium <- droplevels(dds$medium) # remove factor levels without samples
+dds$genotype <- droplevels(dds$genotype) # remove factor levels without samples
+dds$genotype <- relevel(dds$genotype, ref = 'WT') # change order of factor levels to get Pcut6MUT/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES.SIG.csv'), quote = FALSE)
+
+# Pcut6MUT-YES vs WT-YES+DMSO
+dds <- DESeqDataSet(se, design = ~ genotype)
+dds <- dds[, (dds$genotype == 'Pcut6MUT') | (dds$genotype == 'WT' & dds$medium == 'YES_DMSO')]
+dds$medium <- droplevels(dds$medium) 
+dds$genotype <- droplevels(dds$genotype)
+dds$genotype <- relevel(dds$genotype, ref = 'WT')
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_DMSO.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_DMSO.SIG.csv'), quote = FALSE)
+
+# cbf11KO-YES vs WT-YES
+dds <- DESeqDataSet(se, design = ~ genotype)
+dds <- dds[, dds$medium == 'YES'] # remove YES+ammonium/DMSO/cerulenin samples
+dds <- dds[, dds$genotype %in% c('cbf11', 'WT')] # remove YES+ammonium/DMSO/cerulenin samples
+dds$medium <- droplevels(dds$medium) # remove factor levels without samples
+dds$genotype <- droplevels(dds$genotype) # remove factor levels without samples
+dds$genotype <- relevel(dds$genotype, ref = 'WT') # change order of factor levels to get mut/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.SIG.csv'), quote = FALSE)
+
+# cbf11DBM-YES vs WT-YES
+dds <- DESeqDataSet(se, design = ~ genotype)
+dds <- dds[, dds$medium == 'YES'] # remove YES+ammonium/DMSO/cerulenin samples
+dds <- dds[, dds$genotype %in% c('cbf11DBM', 'WT')] # remove YES+ammonium/DMSO/cerulenin samples
+dds$medium <- droplevels(dds$medium) # remove factor levels without samples
+dds$genotype <- droplevels(dds$genotype) # remove factor levels without samples
+dds$genotype <- relevel(dds$genotype, ref = 'WT') # change order of factor levels to get mut/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.SIG.csv'), quote = FALSE)
+```
+
+
+## DEG calling for coding genes only
+
+```{r, eval=TRUE}
+se_coding <- se[grep('SPNCRNA', rownames(se), invert = TRUE), ]
+gff.genes_coding <- gff.genes[grep('SPNCRNA', gff.genes$ID, invert = TRUE), ]
+
+# Pcut6MUT-YES vs WT-YES
+dds_coding <- DESeqDataSet(se_coding, design = ~ genotype)
+dds_coding <- dds_coding[, dds_coding$medium == 'YES'] # remove YES+ammonium/DMSO/cerulenin samples
+dds_coding <- dds_coding[, dds_coding$genotype %in% c('Pcut6MUT', 'WT')] # remove YES+ammonium/DMSO/cerulenin samples
+dds_coding$medium <- droplevels(dds_coding$medium) # remove factor levels without samples
+dds_coding$genotype <- droplevels(dds_coding$genotype) # remove factor levels without samples
+dds_coding$genotype <- relevel(dds_coding$genotype, ref = 'WT') # change order of factor levels to get Pcut6MUT/WT fold change (= define the reference)
+dds_coding <- DESeq(dds_coding)
+res_coding <- results(dds_coding, alpha = padj_threshold)
+summary(res_coding[res_coding$padj <= padj_threshold & !is.na(res_coding$padj), ])
+res_coding <- cbind(gff.genes_coding$Name, res_coding)
+colnames(res_coding)[1] <- 'gene_name'
+rownames(res_coding) <- gff.genes_coding$ID
+write.csv(res_coding, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_coding.csv'), quote = FALSE)
+res_coding.sig <- res_coding[which(res_coding$padj <= padj_threshold), ]
+res_coding.sig <- res_coding.sig[order(res_coding.sig$log2FoldChange), ]
+write.csv(res_coding.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_coding.SIG.csv'), quote = FALSE)
+
+# Pcut6MUT-YES vs WT-YES+DMSO
+dds_coding <- DESeqDataSet(se_coding, design = ~ genotype)
+dds_coding <- dds_coding[, (dds_coding$genotype == 'Pcut6MUT') | (dds_coding$genotype == 'WT' & dds_coding$medium == 'YES_DMSO')]
+dds_coding$medium <- droplevels(dds_coding$medium) 
+dds_coding$genotype <- droplevels(dds_coding$genotype)
+dds_coding$genotype <- relevel(dds_coding$genotype, ref = 'WT')
+dds_coding <- DESeq(dds_coding)
+res_coding <- results(dds_coding, alpha = padj_threshold)
+summary(res_coding[res_coding$padj <= padj_threshold & !is.na(res_coding$padj), ])
+res_coding <- cbind(gff.genes_coding$Name, res_coding)
+colnames(res_coding)[1] <- 'gene_name'
+rownames(res_coding) <- gff.genes_coding$ID
+write.csv(res_coding, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_coding_DMSO.csv'), quote = FALSE)
+res_coding.sig <- res_coding[which(res_coding$padj <= padj_threshold), ]
+res_coding.sig <- res_coding.sig[order(res_coding.sig$log2FoldChange), ]
+write.csv(res_coding.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_DMSO_coding.SIG.csv'), quote = FALSE)
+```
+
+
+## DEG calling for ncRNA genes only
+
+```{r, eval=TRUE}
+se_noncoding <- se[grep('SPNCRNA', rownames(se)), ]
+gff.genes_noncoding <- gff.genes[grep('SPNCRNA', gff.genes$ID), ]
+
+# Pcut6MUT-YES vs WT-YES
+dds_noncoding <- DESeqDataSet(se_noncoding, design = ~ genotype)
+dds_noncoding <- dds_noncoding[, dds_noncoding$medium == 'YES'] # remove YES+ammonium/DMSO/cerulenin samples
+dds_noncoding <- dds_noncoding[, dds_noncoding$genotype %in% c('Pcut6MUT', 'WT')] # remove YES+ammonium/DMSO/cerulenin samples
+dds_noncoding$medium <- droplevels(dds_noncoding$medium) # remove factor levels without samples
+dds_noncoding$genotype <- droplevels(dds_noncoding$genotype) # remove factor levels without samples
+dds_noncoding$genotype <- relevel(dds_noncoding$genotype, ref = 'WT') # change order of factor levels to get Pcut6MUT/WT fold change (= define the reference)
+dds_noncoding <- DESeq(dds_noncoding)
+res_noncoding <- results(dds_noncoding, alpha = padj_threshold)
+summary(res_noncoding[res_noncoding$padj <= padj_threshold & !is.na(res_noncoding$padj), ])
+res_noncoding <- cbind(gff.genes_noncoding$Name, res_noncoding)
+colnames(res_noncoding)[1] <- 'gene_name'
+rownames(res_noncoding) <- gff.genes_noncoding$ID
+write.csv(res_noncoding, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_noncoding.csv'), quote = FALSE)
+res_noncoding.sig <- res_noncoding[which(res_noncoding$padj <= padj_threshold), ]
+res_noncoding.sig <- res_noncoding.sig[order(res_noncoding.sig$log2FoldChange), ]
+write.csv(res_noncoding.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_noncoding.SIG.csv'), quote = FALSE)
+
+# Pcut6MUT-YES vs WT-YES+DMSO
+dds_noncoding <- DESeqDataSet(se_noncoding, design = ~ genotype)
+dds_noncoding <- dds_noncoding[, (dds_noncoding$genotype == 'Pcut6MUT') | (dds_noncoding$genotype == 'WT' & dds_noncoding$medium == 'YES_DMSO')]
+dds_noncoding$medium <- droplevels(dds_noncoding$medium) 
+dds_noncoding$genotype <- droplevels(dds_noncoding$genotype)
+dds_noncoding$genotype <- relevel(dds_noncoding$genotype, ref = 'WT')
+dds_noncoding <- DESeq(dds_noncoding)
+res_noncoding <- results(dds_noncoding, alpha = padj_threshold)
+summary(res_noncoding[res_noncoding$padj <= padj_threshold & !is.na(res_noncoding$padj), ])
+res_noncoding <- cbind(gff.genes_noncoding$Name, res_noncoding)
+colnames(res_noncoding)[1] <- 'gene_name'
+rownames(res_noncoding) <- gff.genes_noncoding$ID
+write.csv(res_noncoding, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_noncoding_DMSO.csv'), quote = FALSE)
+res_noncoding.sig <- res_noncoding[which(res_noncoding$padj <= padj_threshold), ]
+res_noncoding.sig <- res_noncoding.sig[order(res_noncoding.sig$log2FoldChange), ]
+write.csv(res_noncoding.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES_DMSO_noncoding.SIG.csv'), quote = FALSE)
+```
+
+
+## Plots
+
+```{r, eval=TRUE}
+padj_threshold <- 0.05
+lfce_threshold <- 1
+
+library(gplots)
+library(RColorBrewer)
+
+degs.11 <- read.csv(paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.csv'), row.names = 1)
+degs.dbm <- read.csv(paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.csv'), row.names = 1)
+degs <- unique(c(rownames(degs.11[degs.11$padj <= padj_threshold & 
+                                    !is.na(degs.11$padj) &
+                                    abs(degs.11$log2FoldChange) >= lfce_threshold, ]), 
+                 rownames(degs.dbm[degs.dbm$padj <= padj_threshold & 
+                                     !is.na(degs.dbm$padj) &
+                                     abs(degs.dbm$log2FoldChange >= lfce_threshold), ])))
+
+degs.11 <- degs.11[rownames(degs.11) %in% degs, ]
+degs.dbm <- degs.dbm[rownames(degs.dbm) %in% degs, ]
+
+expression <- cbind(degs.11$log2FoldChange, degs.dbm$log2FoldChange)
+
+colfunc <- colorRampPalette(c('blue', 'black', 'yellow'))
+pdf(paste0(image_dir, 'DEG_heatmap.pdf'))
+heatmap.2(expression, 
+          scale = 'row',
+          trace = 'none',
+          density.info = 'none',
+          cexCol = 0.5,
+          col = colfunc(40))
+dev.off()
+```
+
+
+## DEG calling with RUVseq normalization
+
+used for the CSL DBM and TROL papers
+
+```{r, eval=FALSE}
+padj_threshold <- 0.05
+load('se_ALL.rda')
+gff <- import.gff3(genome_gff)
+gff.genes <- gff[gff$type == 'gene', ]
+
+
+# YES samples only
+se.yes <- se[, se$medium == 'YES']
+colnames(se.yes) <- paste0(se.yes$sample_ID, '_', se.yes$sequencing_run) # resolves non-unique sample names
+differences <- makeGroups(se.yes$genotype)
+pheno_data <- data.frame(genotype = se.yes$genotype, 
+                         row.names = paste0(se.yes$sample_ID, '_', se.yes$sequencing_run))
+counts_ruv <- assay(se.yes)
+set <- newSeqExpressionSet(counts_ruv,
+                           phenoData = as(pheno_data, "AnnotatedDataFrame"))
+set <- betweenLaneNormalization(set, which = "upper")
+set <- RUVs(set, rownames(set), k = 1, differences)
+dds.norm <- DESeqDataSetFromMatrix(countData = counts_ruv,
+                                   colData = cbind(colData(se.yes), W_1 = set$W_1),
+                                   design = ~ W_1 + genotype)
+dds.norm <- DESeq(dds.norm)
+
+# cbf11 YES vs WT YES
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "cbf11", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# cbf11DBM YES vs WT YES
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "cbf11DBM", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# Pcut6MUT YES vs WT YES
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "Pcut6MUT", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_Pcut6MUT-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# mga2 YES vs WT YES
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "mga2", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_mga2-YES_vs_WT-YES.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_mga2-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# mga2cbf11 YES vs WT YES
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "mga2_cbf11", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_mga2cbf11-YES_vs_WT-YES.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_mga2cbf11-YES_vs_WT-YES.RUVSeq-norm.SIG.csv'), quote = FALSE)
+```
+
+```{r, eval=FALSE}
+# cerulenin / DMSO samples only
+se.cer <- se[, se$medium %in% c('YES_cerulenin', 'YES_DMSO')]
+#colnames(se.ce) <- paste0(se.cer$sample_ID, '_', se.cer$sequencing_run) # resolves non-unique sample names
+differences <- makeGroups(se.cer$medium)
+pheno_data <- data.frame(genotype = se.cer$medium, 
+                         row.names = se.cer$sample_ID)
+counts_ruv <- assay(se.cer)
+set <- newSeqExpressionSet(counts_ruv,
+                           phenoData = as(pheno_data, "AnnotatedDataFrame"))
+set <- betweenLaneNormalization(set, which = "upper")
+set <- RUVs(set, rownames(set), k = 1, differences)
+dds.norm <- DESeqDataSetFromMatrix(countData = counts_ruv,
+                                   colData = cbind(colData(se.cer), W_1 = set$W_1),
+                                   design = ~ W_1 + medium)
+dds.norm <- DESeq(dds.norm)
+
+# WT YES+cerulenin vs WT YES+DMSO
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("medium", "YES_cerulenin", "YES_DMSO") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_WT-YES+cerulenin_vs_WT-YES+DMSO.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_WT-YES+cerulenin_vs_WT-YES+DMSO.RUVSeq-norm.SIG.csv'), quote = FALSE)
+```
+
+```{r, eval=FALSE}
+# YES+AMM samples only
+se.amm <- se[, se$medium == 'YES_AMM']
+colnames(se.amm) <- paste0(se.amm$sample_ID, '_', se.amm$sequencing_run) # resolves non-unique sample names
+differences <- makeGroups(se.amm$genotype)
+pheno_data <- data.frame(genotype = se.amm$genotype, 
+                         row.names = paste0(se.amm$sample_ID, '_', se.amm$sequencing_run))
+counts_ruv <- assay(se.amm)
+set <- newSeqExpressionSet(counts_ruv,
+                           phenoData = as(pheno_data, "AnnotatedDataFrame"))
+set <- betweenLaneNormalization(set, which = "upper")
+set <- RUVs(set, rownames(set), k = 1, differences)
+dds.norm <- DESeqDataSetFromMatrix(countData = counts_ruv,
+                                   colData = cbind(colData(se.amm), W_1 = set$W_1),
+                                   design = ~ W_1 + genotype)
+dds.norm <- DESeq(dds.norm)
+
+# cbf11 YES+AMM vs WT YES+AMM
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "cbf11", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_cbf11-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_cbf11-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# cbf11DBM YES+AMM vs WT YES+AMM
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "cbf11DBM", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_cbf11DBM-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# mga2 YES+AMM vs WT YES+AMM
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "mga2", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_mga2-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_mga2-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.SIG.csv'), quote = FALSE)
+
+# mga2cbf11 YES+AMM vs WT YES+AMM
+res.norm <- results(dds.norm, alpha = padj_threshold, contrast = c("genotype", "mga2_cbf11", "WT") )
+summary(res.norm[res.norm$padj <= padj_threshold & !is.na(res.norm$padj), ])
+res.norm <- cbind(gene_name = gff.genes$Name, res.norm)
+rownames(res.norm) <- rownames(dds.norm)
+write.csv(res.norm, file = paste0(deg_dir, 'DESeq2results_mga2cbf11-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.csv'), quote = FALSE)
+res.norm.sig <- res.norm[which(res.norm$padj <= padj_threshold), ]
+res.norm.sig <- res.norm.sig[order(res.norm.sig$log2FoldChange), ]
+write.csv(res.norm.sig, file = paste0(deg_dir, 'DESeq2results_mga2cbf11-YES+AMM_vs_WT-YES+AMM.RUVSeq-norm.SIG.csv'), quote = FALSE)
+```
+
+
+
+```{r}
+# YES vs YES+AMM
+# cbf11KO-YES vs cbf11KO-YES+AMM
+dds <- DESeqDataSet(se, design = ~ medium)
+dds <- dds[, dds$genotype == 'cbf11'] 
+dds$medium <- droplevels(dds$medium) # remove factor levels without samples
+dds$genotype <- droplevels(dds$genotype) # remove factor levels without samples
+dds$genotype <- relevel(dds$medium, ref = 'YES') # change order of factor levels to get mut/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_cbf11-YES+AMM.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_cbf11-YES_vs_cbf11-YES+AMM.SIG.csv'), quote = FALSE)
+```
+
+***
+
+```{r}
+sessionInfo()
+```
+`
